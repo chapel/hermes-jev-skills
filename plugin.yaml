@@ -1,0 +1,9 @@
+name: jev-skills
+version: 0.1.0
+description: Additive Jev-backed skill search and advisory turn-context suggestions.
+author: Local Hermes plugin
+provides_tools:
+  - search_skills
+provides_hooks:
+  - pre_llm_call
+  - post_tool_call
