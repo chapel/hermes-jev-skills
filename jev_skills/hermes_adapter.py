@@ -253,7 +253,8 @@ class DiscoveryPlugin:
         for message in history or []:
             if not isinstance(message, dict) or message.get('role') not in ('user', 'assistant'):
                 continue
-            content = _visible_text(message)
+            # Sidecar injections are local dedup evidence, not remote task evidence.
+            content = message.get('content')
             if isinstance(content, str) and content.strip():
                 content = _clean(content)
                 if content:

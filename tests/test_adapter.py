@@ -307,16 +307,31 @@ class AdapterTests(unittest.TestCase):
                                   {'role': 'assistant', 'content': 'I can capture the UI.'}])
         self.assertNotIn('SECRET', json.dumps(recent))
 
-    def test_recent_context_uses_effective_sidecar_without_hidden_text(self):
+    def test_sidecars_deduplicate_locally_without_sending_injected_context(self):
         self.ctx.settings['history_messages'] = 2
-        history = [{'role': 'user', 'content': 'HIDDEN USER', 'api_content': 'Use screenshots'},
-                   {'role': 'assistant', 'content': 'HIDDEN ASSISTANT',
-                    'api_content': 'I can capture the UI.\n\n' + self.block(self.catalog[0])}]
-        self.suggest(history)
-        self.assertEqual(self.calls[-1][2]['recent_context'], [
-            {'role': 'user', 'content': 'Use screenshots'},
-            {'role': 'assistant', 'content': 'I can capture the UI.'}])
-        self.assertNotIn('HIDDEN', json.dumps(self.calls[-1]))
+        payloads = []
+        def requester(payload, api_key, timeout):
+            payloads.append(payload)
+            return {'model': 'offline-fixture', 'answers': {
+                name: {'type': 'noul', 'noul': self.probs[name]}
+                for name in payload['questions']}}
+        self.plugin.ranker = lambda *a, **kw: rank_skills(*a, requester=requester, **kw)
+        private_markers = ('SYNTHETIC_PRIVATE_MEMORY', 'SYNTHETIC_OTHER_PLUGIN_CONTEXT')
+        for role, raw in (('user', 'Use app screenshots'), ('assistant', 'I can capture the UI.')):
+            with self.subTest(role=role):
+                # Mirrors Hermes's raw -> memory -> plugins order; the integration
+                # regression constructs this with the real Hermes composer.
+                sidecar = '\n\n'.join((raw, *private_markers, self.block(self.catalog[0])))
+                history = [{'role': role, 'content': raw, 'api_content': sidecar}]
+                query = f'Continue with raw {role} history'
+                before = len(payloads)
+                self.assertEqual(self.names(self.suggest(history, query=query)), ['alternative'])
+                self.assertEqual(len(payloads), before + 1)
+                self.assertEqual(set(payloads[-1]['questions']), {'alternative', 'pdf'})
+                self.assertEqual(payloads[-1]['state'], {
+                    'user_request': query, 'recent_context': [{'role': role, 'content': raw}]})
+                for marker in (*private_markers, '[Jev skill candidates]'):
+                    self.assertNotIn(marker, json.dumps(payloads[-1]))
 
     def test_bare_slash_history_does_not_disable_suggestions_or_consume_window(self):
         self.ctx.settings['history_messages'] = 2

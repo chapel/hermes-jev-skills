@@ -131,12 +131,30 @@ def child(source, enabled):
         assert 'api_content' not in rewritten
         hook([rewritten], 'After dropping stale sidecar')
         assert set(calls[-1]['questions']) == {'video', 'pdf'}
-        # A nonempty model-visible sidecar replaces, rather than augments,
-        # hidden content, including for the bounded context sent to Jev.
+        # Memory and other plugins precede Jev's block in real composition.
+        # Both roles use sidecars for local dedup, but only raw text may leave
+        # as remote task evidence. Keep an eligible question to force a send.
+        private_markers = ('SYNTHETIC_PRIVATE_MEMORY', 'SYNTHETIC_OTHER_PLUGIN_CONTEXT')
+        for role, raw in (('user', 'Use app screenshots'), ('assistant', 'I can capture the UI.')):
+            sidecar = compose_user_api_content(raw, private_markers[0], private_markers[1] + '\n\n' + context)
+            assert all(marker in sidecar for marker in private_markers)
+            assert context in sidecar
+            query = f'Continue with raw {role} history'
+            before = len(calls)
+            suggestion, _ = hook([{'role': role, 'content': raw, 'api_content': sidecar}], query)
+            assert len(calls) == before + 1, 'privacy check did not exercise the transport'
+            assert set(calls[-1]['questions']) == {'pdf'}, calls[-1]['questions']
+            assert '"name": "pdf"' in suggestion and '"name": "video"' not in suggestion
+            assert calls[-1]['state'] == {
+                'user_request': query, 'recent_context': [{'role': role, 'content': raw}]}, calls[-1]['state']
+            for marker in (*private_markers, '[Jev skill candidates]'):
+                assert marker not in json.dumps(calls[-1]), 'sidecar context leaked to Jev'
+        # A nonempty sidecar replaces hidden content for local dedup only;
+        # remote context still comes from cleaned raw content.
         hidden = {'role': 'assistant', 'content': api_content, 'api_content': 'Visible replacement'}
         hook([hidden], 'Effective sidecar takes precedence')
         assert set(calls[-1]['questions']) == {'video', 'pdf'}
-        assert calls[-1]['state']['recent_context'] == [{'role': 'assistant', 'content': 'Visible replacement'}]
+        assert calls[-1]['state']['recent_context'] == [{'role': 'assistant', 'content': user}]
         probabilities.update(video=.92, pdf=.01)
         loaded = json.loads(registry.dispatch('skill_view', {'name': 'video'}, task_id='integration'))
         assert loaded['success'] and 'FULL VIDEO BODY' in loaded['content'], loaded
@@ -238,6 +256,7 @@ def main():
                       'normal_skill_view': True, 'hook_user_context': True,
                       'slash_history_regression': True,
                       'per_skill_prefilter_and_explicit_search': True, 'effective_api_content': True,
+                      'raw_history_privacy_and_local_sidecar_dedup': True,
                       'simulated_compaction_retention_and_removal': True, 'real_drop_stale_api_content': True,
                       'fake_inference_calls': results[1]['fake_inference_calls'], 'live_requests': 0}, indent=2))
 

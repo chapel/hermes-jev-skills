@@ -29,13 +29,14 @@ All commands ran with an empty inherited environment, project-local `.scratch` H
 `/home/chapel/Projects/hermes-jev-skills/.venv/bin/python`; integration children use the
 verified Hermes source's `.venv/bin/python` and separate synthetic homes.
 
-### Observed RED → GREEN
+### Initial deduplication RED → GREEN
 
 - Before implementation, `python -m unittest discover -s tests -p test_adapter.py -v`
   ran 24 tests and reported **21 failing assertions/subtests**. Failures showed already-presented
   skills still reaching the ranker, repeated rows with changed scores/lists, omitted rows blocked
-  by whole-block deduplication, credential lookup on an empty eligible catalog, and hidden
-  `content` rather than effective `api_content` being sent as recent context.
+  by whole-block deduplication, and credential lookup on an empty eligible catalog. That
+  initial run also included an incorrect expectation that outbound recent context should
+  use sidecars; the privacy review below replaces that expectation with a regression.
 - Before implementation, the extended real-Hermes integration failed because the second
   hook request still contained both `video` and `pdf` questions when retained context had
   already presented `video`; only `pdf` should have been evaluated.
@@ -58,6 +59,36 @@ The integration uses the actual registry, hook collector, catalog, ranking engin
 `compose_user_api_content`, `build_api_messages`, and `drop_stale_api_content`. It verifies
 that retained recommendations prefilter the provider payload, that full removal restores
 eligibility, and that system-prompt and skills-index bytes stay unchanged.
+
+### Privacy review correction: observed RED → GREEN
+
+The sole P1 finding in `4326fea` was that `recent_context` read effective `api_content`
+rather than raw `content`. Hermes composes raw text, then recalled memory, then plugin
+context. Stripping from the Jev marker therefore left earlier memory and other-plugin
+injections in the outbound TypeSafe state when history sharing was enabled.
+
+- **RED, before the fix:** `python -m unittest discover -s tests -p test_adapter.py
+  -k test_sidecars_deduplicate_locally_without_sending_injected_context -v` ran one test
+  with **two failing subtests**, one per user/assistant role. The fake external transport
+  received `SYNTHETIC_PRIVATE_MEMORY` and `SYNTHETIC_OTHER_PLUGIN_CONTEXT` in
+  `state.recent_context` instead of exactly the raw text. The retained `video` question
+  was already absent, proving local deduplication worked while privacy failed.
+- **RED, real Hermes:** the integration command above failed its exact outbound-state
+  assertion with a real `<memory-context>` block and both synthetic markers still present.
+  It used `compose_user_api_content`, the real hook collector and engine, and fake transport;
+  no live service was contacted.
+- **Fix:** only outbound history selection returns to `message.get('content')`.
+  `_visible_text` still supplies effective sidecars for the separate local deduplication scan.
+  The incorrect sidecar-sharing test and documentation were replaced, not preserved as policy.
+- **GREEN:** `python -m unittest discover -s tests -v`: **51 tests passed**, including
+  both privacy subtests. The real-Hermes integration passed with **14 fake evaluations
+  and zero live requests** under the same isolated environment described above.
+
+The regression keeps an eligible question so an actual fake-transport call is required.
+For both user and assistant sidecars it asserts exact raw outbound state, absence of the
+private markers and Jev block from the entire payload, absence of the retained `video`
+question, and continued delivery of another eligible candidate. Local model-visible
+deduplication evidence is deliberately broader than authorized remote task evidence.
 
 **Evidence ceiling:** compaction boundaries and rewritten summary content are synthetic;
 only the sidecar invalidation helper is executed, not an LLM compression call or full
