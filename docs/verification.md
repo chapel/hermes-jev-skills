@@ -1,4 +1,4 @@
-# Initial verification
+# Verification
 
 ## Scope
 
@@ -16,6 +16,54 @@ The default-profile plugin was **not installed or enabled** for these checks. No
 - Independent review found one bare slash-history handling defect. After a focused fix, independent closure review approved the change and reran all 37 tests plus the real-Hermes integration (5 fake evaluations, zero live requests).
 
 Integration testing exposed that Hermes rejects a plugin-relative `model` configuration key as reserved. The plugin uses `jev_model`. Payload sizing also exposed excess repeated instructions: compact self-contained questions now fit the 203-entry snapshot under the default byte limit without dropping descriptions.
+
+## Context-based per-skill deduplication
+
+This follow-up was verified offline in the standalone plugin worktree, without installing,
+enabling, configuring, or restarting a live plugin or Hermes process. The source at
+`/home/chapel/.hermes/releases/hermes-agent-stable-363be842494a` reports Git HEAD
+`bba60eb66b3518f7ee196df3904c45841f73d19b`; the directory suffix is not its Git identity.
+
+All commands ran with an empty inherited environment, project-local `.scratch` HOME/TMPDIR,
+`PATH=/usr/bin:/bin`, `LANG=C.UTF-8`, and `PYTHONDONTWRITEBYTECODE=1`. The outer interpreter was
+`/home/chapel/Projects/hermes-jev-skills/.venv/bin/python`; integration children use the
+verified Hermes source's `.venv/bin/python` and separate synthetic homes.
+
+### Observed RED → GREEN
+
+- Before implementation, `python -m unittest discover -s tests -p test_adapter.py -v`
+  ran 24 tests and reported **21 failing assertions/subtests**. Failures showed already-presented
+  skills still reaching the ranker, repeated rows with changed scores/lists, omitted rows blocked
+  by whole-block deduplication, credential lookup on an empty eligible catalog, and hidden
+  `content` rather than effective `api_content` being sent as recent context.
+- Before implementation, the extended real-Hermes integration failed because the second
+  hook request still contained both `video` and `pdf` questions when retained context had
+  already presented `video`; only `pdf` should have been evaluated.
+- After implementation, `python -m unittest discover -s tests -v`: **51 tests passed**.
+  Adapter tests exercise the real engine with an injected external evaluation response.
+- `python scripts/check_hermes_integration.py --hermes-source
+  /home/chapel/.hermes/releases/hermes-agent-stable-363be842494a`: **passed**, with
+  **12 fake evaluations and zero live requests**. Network connects are blocked, including
+  Hermes's incidental metadata startup probe.
+
+Coverage includes exact `(name, description)` identity regardless of score/order; separate
+namespaces and overlapping alternatives; changed descriptions; explicit full-catalog search
+and cache partitioning; omitted rows remaining eligible; empty eligibility skipping the
+ranker and budgets; complete/incomplete blocks, malformed rows and multiple blocks; effective
+user/assistant sidecars and ignored system/tool/reasoning fields; unchanged caller history
+and catalog; context removal versus retained tails; summary-only mentions; recreated plugin
+instances and session isolation; and the existing stale-turn result guard.
+
+The integration uses the actual registry, hook collector, catalog, ranking engine,
+`compose_user_api_content`, `build_api_messages`, and `drop_stale_api_content`. It verifies
+that retained recommendations prefilter the provider payload, that full removal restores
+eligibility, and that system-prompt and skills-index bytes stay unchanged.
+
+**Evidence ceiling:** compaction boundaries and rewritten summary content are synthetic;
+only the sidecar invalidation helper is executed, not an LLM compression call or full
+conversation lifecycle. These checks prove the ordinary hook/sidecar path, not all provider
+backends or improved agent decisions. Legacy candidate blocks have no provenance signature;
+recognition is format-based, not authentication. No new live inference was used for this change.
 
 ## Bounded live smoke
 

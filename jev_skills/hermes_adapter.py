@@ -49,6 +49,45 @@ def _rank(*args, **kwargs):
     return rank_skills(*args, **kwargs)
 
 
+def _visible_text(message):
+    """Match Hermes's user/assistant sidecar replacement, not hidden content."""
+    if not isinstance(message, dict) or message.get('role') not in ('user', 'assistant'):
+        return ''
+    sidecar = message.get('api_content')
+    content = sidecar if isinstance(sidecar, str) and sidecar else message.get('content')
+    return content if isinstance(content, str) else ''
+
+
+def _presented_skills(history):
+    """Exact metadata pairs printed in complete, retained candidate blocks.
+
+    No ever-seen state: compaction/removal restores eligibility. Legacy blocks
+    need no signature; names in prose, omitted rows and unfinished blocks do not count.
+    """
+    presented = set()
+    for message in history or []:
+        pending = None
+        # The renderer uses LF; splitlines would also split Unicode descriptions.
+        for line in _visible_text(message).split('\n'):
+            line = line.strip()
+            if line == '[Jev skill candidates]':
+                pending = set()  # A new opener abandons any incomplete block.
+            elif line == '[/Jev skill candidates]':
+                if pending is not None:
+                    presented.update(pending)
+                pending = None
+            elif pending is not None:
+                try:
+                    row = json.loads(line)
+                except (ValueError, RecursionError):
+                    continue
+                if isinstance(row, dict):
+                    name, description = row.get('name'), row.get('description')
+                    if all(isinstance(value, str) and value.strip() for value in (name, description)):
+                        pending.add((name, description))
+    return presented
+
+
 def _clean(text):
     # Do not send previously injected recommendations back to Jev as task evidence.
     text = text.split('[Jev skill candidates]', 1)[0]
@@ -122,16 +161,22 @@ class DiscoveryPlugin:
         except Exception:
             pass  # Diagnostics cannot break discovery or tool execution.
 
-    def evaluate(self, query, recent, session_id, cfg):
+    def evaluate(self, query, recent, session_id, cfg, *, presented=()):
         if not cfg['allow_remote']:
             return _error('remote_disabled', 'Enable allow_remote locally to permit TypeSafe requests.', 'disabled')
         if not isinstance(query, str) or not query.strip() or len(query) > cfg['max_query_chars']:
             return _error('invalid_query', 'Provide a nonempty query within max_query_chars.')
         try:
+            skills = self.catalog_loader()
+            if presented:
+                skills = [row for row in skills if (row['name'], row['description']) not in presented]
+            if not skills:
+                # No eligible questions: neither credentials, ranker nor attempt budget needed.
+                return {'status': 'ok', 'model': cfg['jev_model'], 'scores': [], 'usage': None,
+                        'latency_ms': 0, 'cached': False, 'catalog_count': 0}
             key = self.secret_getter()
             if not key:
                 return _error('missing_key', 'Configure TYPESAFE_API_KEY locally, not in chat.', 'setup_needed')
-            skills = self.catalog_loader()
         except Exception:
             return _error('catalog_or_setup', 'Skill catalog or profile credential scope unavailable.')
         scope = self.scope(session_id)
@@ -208,7 +253,7 @@ class DiscoveryPlugin:
         for message in history or []:
             if not isinstance(message, dict) or message.get('role') not in ('user', 'assistant'):
                 continue
-            content = message.get('content')
+            content = _visible_text(message)
             if isinstance(content, str) and content.strip():
                 content = _clean(content)
                 if content:
@@ -237,7 +282,8 @@ class DiscoveryPlugin:
                 version = self.turn_versions.get(scope, 0) + 1
                 self.turn_versions[scope] = version
             recent = self.recent_context(conversation_history, query, cfg)
-            result = self.evaluate(query, recent, session_id or task_id, cfg)
+            result = self.evaluate(query, recent, session_id or task_id, cfg,
+                                   presented=_presented_skills(conversation_history))
             if result.get('status') != 'ok':
                 # Fail open; never tell the model a provider failure means no relevant skill exists.
                 return ''
@@ -259,16 +305,8 @@ class DiscoveryPlugin:
                 lines.append(f'{len(matching) - len(shown)} additional candidates omitted for context budget; search_skills can page results.')
             lines.append('[/Jev skill candidates]')
             text = '\n'.join(lines)
-            # Deduplicate only against visible conversation bytes, not an in-memory
-            # ever-seen flag: compaction may have removed the previous suggestion.
-            already_visible = any(
-                isinstance(message, dict) and any(
-                    isinstance(message.get(field), str) and text in message[field]
-                    for field in ('content', 'api_content')
-                ) for message in (conversation_history or [])
-            )
             with self.lock:
-                if self.turn_versions.get(scope) != version or already_visible:
+                if self.turn_versions.get(scope) != version:
                     return ''
             self.record({'event': 'suggestion', 'session_id': scope[1], 'names': [r['name'] for r in shown]}, cfg)
             return text

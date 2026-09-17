@@ -12,6 +12,7 @@ This first version deliberately leaves the system prompt, existing skills index,
 - Asks one independent **Noul** question per skill, containing that skill's name and description. State holds the request and optional recent context, not an opaque catalog that questions reference by index.
 - Returns raw yes probabilities, descriptions, and explicit pagination totals. Several alternatives can be relevant. A Noul probability is not a calibrated probability of task success or permission to load anything.
 - If enabled, uses Hermes's `pre_llm_call` hook to append a bounded candidate block to the current user message's API representation. The system prompt remains unchanged.
+- Before automatic classification, excludes individual skills whose exact name and description are already printed in complete Jev candidate blocks retained in active user/assistant context. Explicit `search_skills` still searches the full catalog.
 - On failure, injects nothing; ordinary discovery remains available. Explicit searches return a distinguishable error, never false “no matches.”
 
 ## Install locally, initially disabled
@@ -75,7 +76,7 @@ By default both `allow_remote` and `auto_suggest` are false. Merely importing or
 
 With remote search enabled, TypeSafe receives **the query, optional supplied context, and all eligible catalog names/descriptions**. Turn-start suggestions send the current user text. No automatic secret redaction is promised; do not enable this on conversations whose text must not leave the main provider. A private skill description is also transmitted metadata.
 
-`history_messages` defaults to 0. Setting it to 1–10 explicitly allows bounded recent user/assistant plain-text messages to be transmitted automatically. It excludes system/tool messages, separate reasoning fields, multimodal blocks, prior Jev injections, and expanded slash-skill bodies where Hermes's extraction helper recognizes them. This is selective context, **not a DLP system**: assistant/user text can itself contain sensitive content. Explicit tool `context` is sent when supplied regardless of `history_messages`.
+`history_messages` defaults to 0. Setting it to 1–10 explicitly allows bounded recent user/assistant plain-text messages to be transmitted automatically. A nonempty string `api_content` replaces `content`, matching Hermes's model-visible representation. It excludes system/tool messages, separate reasoning fields, multimodal blocks, prior Jev injections, and expanded slash-skill bodies where Hermes's extraction helper recognizes them. This is selective context, **not a DLP system**: assistant/user text can itself contain sensitive content. Explicit tool `context` is sent when supplied regardless of `history_messages`.
 
 Defaults and scope:
 
@@ -84,8 +85,12 @@ Defaults and scope:
 - `max_query_chars: 8000`; `max_context_chars: 4000`. Oversized explicit input is rejected. Automatic history clips each selected message to at most 1000 characters within the shared context budget.
 - `max_calls_per_session: 20`, `max_calls_per_process: 200`: in-memory attempt limits, including failures. They reset on process restart; they are not durable dollar/spend limits. Multiple processes have independent limits.
 - One request in flight per plugin instance; a concurrent attempt fails open rather than queuing or spawning unbounded work. There are no automatic retries or redirects. Response size is bounded.
-- `cache_seconds: 300.0`: at most 64 successful evaluations, keyed by profile/session, model, request, context, and catalog metadata. No cache persisted to disk. Changing threshold or pagination does not trigger inference. The `jev-latest` alias can change server-side during a cache lifetime; configure an account-supported pinned model for controlled comparisons.
-- `suggestion_chars: 6000`: maximum advisory block budget, independent from ranking. Identical blocks already present in active history are not reinjected; after compaction removes them, they can appear again.
+- `cache_seconds: 300.0`: at most 64 successful evaluations, keyed by profile/session, model, request, context, and the catalog metadata actually evaluated. Automatic filtered evaluations cannot stand in for full-catalog explicit searches. No cache persisted to disk. Changing threshold or pagination does not trigger inference. The `jev-latest` alias can change server-side during a cache lifetime; configure an account-supported pinned model for controlled comparisons.
+- `suggestion_chars: 6000`: maximum advisory block budget, independent from ranking. Only printed candidate rows count as presented; omitted candidates remain eligible next turn.
+
+Automatic suppression follows **active context, not a turn count or an ever-seen log**. The plugin locally scans complete `[Jev skill candidates]` blocks in effective user/assistant text, even when `history_messages` is 0; this scan does not send that history to Jev. Scores and list ordering do not affect identity. Distinct namespaced names and overlapping skills remain separate; changed descriptions become eligible again. Malformed rows and incomplete blocks are ignored without disabling discovery. Existing unsigned blocks are recognized, not authenticated.
+
+If compaction retains a block in its tail, those skills stay suppressed. Once their complete presentation is absent, they become eligible again; summary text merely mentioning a skill name does not suppress it. There is no suppression state carried between sessions or plugin restarts: retained context is the source of truth. If no skills remain eligible, the automatic path produces no suggestion and does not resolve credentials, call the ranker/provider, or consume attempt budgets. Explicit search, the normal skills index, and `skill_view` remain unrestricted.
 
 Errors such as missing credentials, provider failures, invalid response shapes, input limits, or call limits are not negative classifications. Live service responses are validated before ranking. API errors are sanitized rather than returning response bodies that might echo input or credentials.
 
@@ -109,7 +114,7 @@ Integration against a verified local Hermes checkout/interpreter:
 python3 scripts/check_hermes_integration.py --hermes-source /path/to/hermes-source
 ```
 
-The integration runner uses a project-local scratch HOME, a real plugin loader/catalog/registry/hook path and `skill_view`, a fake external Jev transport, and no inherited credentials. It checks disabled discovery, unchanged index, no system-prompt mutation during use, user-message suggestions, cache reuse, and normal full-skill loading. It does not call a main model or prove a real model chooses better skills.
+The integration runner uses a project-local scratch HOME, a real plugin loader/catalog/registry/hook/engine path and `skill_view`, a fake external Jev transport, and no inherited credentials. It checks disabled discovery, unchanged index, no system-prompt mutation during use, user-message and wire composition, per-skill prefiltering, effective sidecar precedence, full-catalog explicit search, cache reuse, and normal full-skill loading. Simulated compaction boundaries cover retained/removed blocks and invoke Hermes's real `drop_stale_api_content` after a content rewrite. It does not invoke an LLM compressor or main model, or prove a real model chooses better skills.
 
 See [initial verification](docs/verification.md) for the bounded live smoke results and limitations. `scripts/smoke_live.py` makes no requests without `--live`; its opt-in mode sends at most three synthetic queries plus a reviewed catalog snapshot. It needs a key in its process environment, `--catalog <skills-list.json>`, and `--output <local-results.json>`.
 

@@ -28,7 +28,9 @@ def child(source, enabled):
     from hermes_cli.plugins import discover_plugins, get_plugin_manager
     from run_agent import AIAgent
     from agent.system_prompt import build_system_prompt, _skills_prompt
-    from agent.turn_context import _collect_pre_llm_call_context, compose_user_api_content
+    from agent.turn_context import (
+        _collect_pre_llm_call_context, build_api_messages, compose_user_api_content, drop_stale_api_content,
+    )
     from tools.registry import registry
     import tools.skills_tool  # registers the real skill tools
 
@@ -50,12 +52,13 @@ def child(source, enabled):
         # Use the production engine through its injectable HTTP boundary.
         from importlib import import_module
         engine = import_module(plugin.__class__.__module__.rsplit('.', 1)[0] + '.engine')
+        probabilities = {'video': .92, 'pdf': .01}
         def requester(payload, api_key, timeout):
             calls.append(payload)
             assert api_key == 'offline-dummy'
-            assert set(payload['questions']) == {'video', 'pdf'}
+            assert set(payload['questions']) <= {'video', 'pdf'}
             return {'model': 'offline-fixture', 'answers': {
-                name: {'type': 'noul', 'noul': .92 if name == 'video' else .01}
+                name: {'type': 'noul', 'noul': probabilities[name]}
                 for name in payload['questions']}, 'usage': {'input_tokens': 50, 'output_tokens': 2}}
         plugin.ranker = lambda *a, **kw: engine.rank_skills(*a, requester=requester, **kw)
         plugin.secret_getter = lambda: 'offline-dummy'
@@ -75,6 +78,66 @@ def child(source, enabled):
         api_content = compose_user_api_content(user, '', context)
         assert api_content.startswith(user + '\n\n')
         assert len(calls) == 1, 'hook should reuse same session/query/catalog result'
+        retained = {'role': 'user', 'content': user, 'api_content': api_content}
+        probabilities.update(video=.99, pdf=.85)
+
+        def hook(history, query):
+            current = {'role': 'user', 'content': query}
+            messages = [*history, current]
+            before = json.dumps(messages, sort_keys=True)
+            suggestion = _collect_pre_llm_call_context(agent, effective_task_id='integration',
+                turn_id=query, original_user_message=query, messages=messages, conversation_history=history)
+            assert json.dumps(messages, sort_keys=True) == before, 'hook mutated history'
+            sidecar = compose_user_api_content(query, '', suggestion)
+            if sidecar is not None:
+                current['api_content'] = sidecar
+            wire, system = build_api_messages(agent, messages, current_turn_user_idx=len(history),
+                ext_prefetch_cache='', plugin_user_context=suggestion, moa_config=None, active_system_prompt=initial)
+            assert system == initial and wire[0]['content'] == initial
+            assert wire[-1]['content'] == (sidecar or query)
+            for original, sent in zip(history, wire[1:-1]):
+                assert sent['content'] == (original.get('api_content') or original['content'])
+            return suggestion, current
+
+        # Score/task changes cannot reclassify an already-presented skill.
+        suggestion, second = hook([retained], 'Try another approach')
+        assert set(calls[-1]['questions']) == {'pdf'}, calls[-1]['questions']
+        assert '"name": "pdf"' in suggestion and '"name": "video"' not in suggestion
+        before, budget = len(calls), plugin.total_calls
+        assert hook([retained, second], 'Keep going')[0] == ''
+        assert len(calls) == before and plugin.total_calls == budget, 'empty catalog spent a call'
+        # Same query/context, but explicit search must evaluate the full catalog.
+        result = json.loads(registry.dispatch('search_skills',
+            {'query': 'Try another approach', 'context': user}, session_id='integration'))
+        assert result['status'] == 'ok' and not result['cached'], result
+        assert {row['name'] for row in result['candidates']} == {'video', 'pdf'}
+        assert set(calls[-1]['questions']) == {'video', 'pdf'}
+
+        # Simulated compaction boundary: no compressor/LLM call. Retained tail
+        # blocks still count; a name-only summary with the tail removed does not.
+        summary = {'role': 'user', 'content': 'Summary: video and pdf were recommended.'}
+        suggestion, _ = hook([summary, retained], 'After compaction with retained tail')
+        assert set(calls[-1]['questions']) == {'pdf'}
+        assert '"name": "video"' not in suggestion
+        suggestion, _ = hook([summary], 'After compaction without retained tail')
+        assert set(calls[-1]['questions']) == {'video', 'pdf'}
+        assert '"name": "video"' in suggestion
+
+        # Real sidecar invalidation helper after a simulated content rewrite.
+        rewritten = dict(retained, content=summary['content'])
+        hook([rewritten], 'Before dropping stale sidecar')
+        assert set(calls[-1]['questions']) == {'pdf'}
+        drop_stale_api_content(rewritten)
+        assert 'api_content' not in rewritten
+        hook([rewritten], 'After dropping stale sidecar')
+        assert set(calls[-1]['questions']) == {'video', 'pdf'}
+        # A nonempty model-visible sidecar replaces, rather than augments,
+        # hidden content, including for the bounded context sent to Jev.
+        hidden = {'role': 'assistant', 'content': api_content, 'api_content': 'Visible replacement'}
+        hook([hidden], 'Effective sidecar takes precedence')
+        assert set(calls[-1]['questions']) == {'video', 'pdf'}
+        assert calls[-1]['state']['recent_context'] == [{'role': 'assistant', 'content': 'Visible replacement'}]
+        probabilities.update(video=.92, pdf=.01)
         loaded = json.loads(registry.dispatch('skill_view', {'name': 'video'}, task_id='integration'))
         assert loaded['success'] and 'FULL VIDEO BODY' in loaded['content'], loaded
         # Real slash scaffolds return None when invoked without user instructions.
@@ -174,6 +237,8 @@ def main():
                       'unchanged_skill_index': True, 'unchanged_system_prompt_during_use': True,
                       'normal_skill_view': True, 'hook_user_context': True,
                       'slash_history_regression': True,
+                      'per_skill_prefilter_and_explicit_search': True, 'effective_api_content': True,
+                      'simulated_compaction_retention_and_removal': True, 'real_drop_stale_api_content': True,
                       'fake_inference_calls': results[1]['fake_inference_calls'], 'live_requests': 0}, indent=2))
 
 
